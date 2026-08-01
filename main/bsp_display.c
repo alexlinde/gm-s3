@@ -54,13 +54,14 @@ static const char *TAG = "bsp_display";
 /* ---------------------------------------------------------------------------
  * Flush-health instrumentation.
  *
- * For SPI panel IO esp_lvgl_port leaves LVGL's `flush_wait_cb` unset, so
- * `wait_for_flushing()` busy-spins until the panel IO ISR clears
- * `disp->flushing` via lv_disp_flush_ready. If the SPI completion ISR ever
- * stops firing (clock too high, bus contention, peripheral hang, etc.), the
- * busy loop is permanent and starves IDLE -> task watchdog. We hook the
- * LVGL flush-wait events to expose how long the in-progress wait has been
- * pending; the heap monitor in main.c samples this and warns on hang.
+ * A flush that never completes is the classic way this board wedges: LVGL
+ * blocks in `wait_for_flushing()` until the panel IO ISR reports the SPI
+ * transfer done, and with the stock esp_lvgl_port setup (no `flush_wait_cb`)
+ * that wait is a `while(disp->flushing);` busy-spin which starves IDLE ->
+ * task watchdog if the ISR never fires. We install a bounded wait_cb below,
+ * but we still want visibility: these hooks expose how long the in-progress
+ * wait has been pending, for any off-thread observer (nothing samples them
+ * today; bsp_display_get_flush_stats is the hook).
  *
  * Atomics: flush events fire on the LVGL render thread; the sampler reads
  * them from an esp_timer task. uint32 wraparound is fine for counts; the
@@ -114,17 +115,40 @@ void bsp_display_get_flush_stats(bsp_display_flush_stats_t *out)
  * The default esp_lvgl_port flow for SPI panel IO leaves LVGL's flush_wait_cb
  * unset and relies on the panel-IO `on_color_trans_done` ISR to clear
  * `disp->flushing` via lv_disp_flush_ready(). When `esp_lcd_panel_draw_bitmap`
- * fails (e.g. spi_master::setup_dma_priv_buffer returns ENOMEM under transient
- * internal-SRAM pressure from a concurrent cJSON parse + TLS handshake), the
- * transaction is never queued, the ISR never fires, and LVGL falls into the
- * `while(disp->flushing);` busy-spin in lv_refr.c -> task watchdog.
+ * fails (e.g. spi_master::setup_dma_priv_buffer returns ENOMEM while bouncing
+ * a non-DMA draw buffer), the transaction is never queued, the ISR never
+ * fires, and LVGL falls into the `while(disp->flushing);` busy-spin in
+ * lv_refr.c -> task watchdog.
  *
- * We replace the panel-IO color-trans-done callback with our own that gives a
- * binary semaphore (and still calls lv_disp_flush_ready for compatibility),
- * and install a flush_wait_cb that takes the semaphore with a bounded
- * timeout. On timeout we log and return; LVGL clears `disp->flushing` after
- * we return so the next frame can render. We accept potential one-frame
- * tearing in exchange for not wedging the device.
+ * We replace that with a semaphore handshake, split strictly in two:
+ *
+ *   - `on_panel_io_color_done` (ISR) ONLY gives the binary semaphore. It must
+ *     NOT call lv_display_flush_ready(). lv_refr.c's wait_for_flushing() runs
+ *     `if (disp->flushing) { flush_wait_cb(disp); disp->flushing = 0; }`, so
+ *     clearing `flushing` from the ISR makes LVGL skip the wait for every
+ *     flush that finished early, orphaning that flush's token. The next
+ *     genuinely in-flight flush is then satisfied instantly by the stale
+ *     token -- LVGL renders into a buffer GDMA is still reading -- and the
+ *     one-token-ahead desync is permanent once it starts, which also silently
+ *     defeats the timeout below.
+ *   - `flush_wait_cb` (LVGL thread) takes exactly one token and returns;
+ *     LVGL clears `disp->flushing` itself (lv_refr.c:1438).
+ *
+ * Give/take stays 1:1: draw_buf_flush() sets `flushing = 1` exactly once per
+ * flush_cb and, since we are double-buffered, always runs wait_for_flushing()
+ * before the next one; esp_lcd_panel_io_spi arms the done callback only on
+ * the final chunk of a draw_bitmap, so one successful flush == one give ==
+ * one take.
+ *
+ * The take is bounded by FLUSH_TIMEOUT_MS so a draw_bitmap that never queued
+ * cannot wedge us: we count it and return, LVGL clears `flushing`, and the
+ * next frame renders. We accept potential one-frame tearing in exchange for
+ * not wedging the device.
+ *
+ * Ordering requirement: flush_wait_cb must be installed before this ISR
+ * callback can fire for the first time, otherwise wait_for_flushing() takes
+ * its no-wait_cb branch (`while(disp->flushing);`) with nothing left to clear
+ * `flushing`. bsp_display_init() installs both under the LVGL lock.
  * ------------------------------------------------------------------------- */
 
 #define FLUSH_TIMEOUT_MS 200
@@ -139,16 +163,12 @@ static bool IRAM_ATTR on_panel_io_color_done(esp_lcd_panel_io_handle_t io,
 {
     BaseType_t hpw = pdFALSE;
     if (s_flush_done_sem) {
-        /* Binary sem: a give while count==1 is a no-op, which is exactly what
-         * we want if a previous wait_cb timed out and the ISR finally fired
-         * after we'd already moved on. */
+        /* Give only -- never lv_display_flush_ready() from here; see the
+         * contract above. Binary sem: a give while count==1 is a no-op, which
+         * is exactly what we want if a previous wait_cb timed out and the ISR
+         * finally fired after we'd already moved on. */
         xSemaphoreGiveFromISR(s_flush_done_sem, &hpw);
     }
-    /* Keep esp_lvgl_port's invariant of clearing LVGL's flushing flag from
-     * the ISR. With our flush_wait_cb installed LVGL will re-clear it after
-     * wait_cb returns; double-clear is harmless. */
-    lv_display_t *disp = (lv_display_t *)user_ctx;
-    if (disp) lv_display_flush_ready(disp);
     return hpw == pdTRUE;
 }
 
@@ -162,8 +182,8 @@ static void flush_wait_cb(lv_display_t *disp)
     /* Timeout: the on_color_trans_done ISR didn't fire within FLUSH_TIMEOUT_MS.
      * Most likely the SPI transaction was never queued because
      * esp_lcd_panel_draw_bitmap returned an error; the ISR will never come.
-     * Drain any signal that *does* arrive late so it doesn't get counted
-     * against the next flush. Counter is for the heap-monitor log. */
+     * We return anyway -- LVGL clears `disp->flushing` for us -- so the next
+     * frame can render. Counter is exposed via bsp_display_flush_timeouts. */
     atomic_fetch_add_explicit(&s_flush_timeouts, 1, memory_order_relaxed);
 
     /* Best-effort late-arrival drain: if the ISR fires within the next tick
@@ -283,10 +303,26 @@ esp_err_t bsp_display_init(void)
     const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     ESP_RETURN_ON_ERROR(lvgl_port_init(&lvgl_cfg), TAG, "LVGL port init failed");
 
+    /* buffer_size is in PIXELS, not bytes (esp_lvgl_port_disp.h) -- the port
+     * allocates buffer_size * lv_color_format_get_size(). 20 lines x 240 px =
+     * 4800 px = 9600 B per buffer, two of them: 19,200 B of internal RAM total
+     * for ~1/12 of the screen per buffer. (Passing bytes here silently doubled
+     * both buffers to 40 lines / 19,200 B each.)
+     *
+     * buff_dma is load-bearing: without it the port allocates with
+     * MALLOC_CAP_DEFAULT, which on this board (CONFIG_SPIRAM_USE_MALLOC with
+     * SPIRAM_MALLOC_ALWAYSINTERNAL=4096) puts both buffers in PSRAM. esp_lcd's
+     * SPI panel IO never sets SPI_TRANS_DMA_USE_PSRAM, so spi_master then hits
+     * setup_dma_priv_buffer() and heap_caps_aligned_alloc()s an internal-RAM
+     * bounce buffer the size of the whole flush on every single transfer --
+     * the actual source of the ENOMEM that the flush watchdog above papers
+     * over. MALLOC_CAP_DMA lands them in internal RAM instead, where the
+     * ESP32-S3 AHB-GDMA TX alignment requirement is 1 byte, so the bounce path
+     * is never taken. */
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle   = io_handle,
         .panel_handle = panel,
-        .buffer_size  = BSP_LCD_H_RES * 20 * sizeof(lv_color16_t),
+        .buffer_size  = BSP_LCD_H_RES * 20,   /* pixels */
         .double_buffer = true,
         .hres         = BSP_LCD_H_RES,
         .vres         = BSP_LCD_V_RES,
@@ -297,36 +333,47 @@ esp_err_t bsp_display_init(void)
             .mirror_x = false,
             .mirror_y = false,
         },
+        .flags = {
+            .buff_dma = true,
+        },
     };
     lv_display_t *disp = lvgl_port_add_disp(&disp_cfg);
     ESP_RETURN_ON_FALSE(disp, ESP_FAIL, TAG, "LVGL display add failed");
 
     /* Replace esp_lvgl_port's panel-IO trans-done callback with ours so a
-     * failed esp_lcd_panel_draw_bitmap doesn't deadlock LVGL forever. We
-     * also install our own flush_wait_cb that yields with a bounded
-     * timeout instead of letting LVGL fall into its default busy-spin. */
+     * failed esp_lcd_panel_draw_bitmap doesn't deadlock LVGL forever, and
+     * install the matching flush_wait_cb that yields with a bounded timeout
+     * instead of letting LVGL fall into its default busy-spin.
+     *
+     * Both must happen atomically w.r.t. the LVGL task, which is already
+     * running (and at a higher priority than app_main) by the time
+     * lvgl_port_add_disp returns: our ISR callback no longer clears
+     * `disp->flushing`, so a flush dispatched with our ISR installed but the
+     * wait_cb not yet installed would busy-spin forever. Holding the LVGL
+     * lock keeps any refresh out of the window. A flush already in flight
+     * across the swap is safe either way -- if esp_lvgl_port's old callback
+     * already cleared `flushing`, LVGL skips the wait and no token is
+     * consumed; if ours fires instead, `flushing` stays set and the token is
+     * consumed by the wait_cb that is installed before we unlock. */
     s_flush_done_sem = xSemaphoreCreateBinary();
     ESP_RETURN_ON_FALSE(s_flush_done_sem, ESP_ERR_NO_MEM, TAG, "Flush sem alloc failed");
     const esp_lcd_panel_io_callbacks_t cbs = {
         .on_color_trans_done = on_panel_io_color_done,
     };
-    ESP_RETURN_ON_ERROR(
-        esp_lcd_panel_io_register_event_callbacks(io_handle, &cbs, disp),
-        TAG, "Panel IO callback register failed");
-
-    /* Flush-health hooks. Registering each event individually instead of
-     * LV_EVENT_ALL keeps our handler off the per-area redraw events that
-     * fire dozens of times per frame. The LVGL task is already running
-     * after lvgl_port_add_disp returns, so we must hold the LVGL lock
-     * while mutating LVGL state. */
-    if (lvgl_port_lock(0)) {
+    ESP_RETURN_ON_FALSE(lvgl_port_lock(0), ESP_ERR_TIMEOUT, TAG, "LVGL lock failed");
+    esp_err_t cb_err = esp_lcd_panel_io_register_event_callbacks(io_handle, &cbs, disp);
+    if (cb_err == ESP_OK) {
+        /* Flush-health hooks. Registering each event individually instead of
+         * LV_EVENT_ALL keeps our handler off the per-area redraw events that
+         * fire dozens of times per frame. */
         lv_display_add_event_cb(disp, on_flush_event, LV_EVENT_FLUSH_START,       NULL);
         lv_display_add_event_cb(disp, on_flush_event, LV_EVENT_FLUSH_FINISH,      NULL);
         lv_display_add_event_cb(disp, on_flush_event, LV_EVENT_FLUSH_WAIT_START,  NULL);
         lv_display_add_event_cb(disp, on_flush_event, LV_EVENT_FLUSH_WAIT_FINISH, NULL);
         lv_display_set_flush_wait_cb(disp, flush_wait_cb);
-        lvgl_port_unlock();
     }
+    lvgl_port_unlock();
+    ESP_RETURN_ON_ERROR(cb_err, TAG, "Panel IO callback register failed");
 
     ESP_LOGI(TAG, "Display ready (%dx%d)", BSP_LCD_H_RES, BSP_LCD_V_RES);
     return ESP_OK;
